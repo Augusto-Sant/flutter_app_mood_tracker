@@ -1,1084 +1,805 @@
 import 'package:flutter/material.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+import 'package:isar/isar.dart';
+import 'package:sembast/sembast_io.dart';
+import 'package:path_provider/path_provider.dart';
 import 'dart:async';
-import 'package:window_size/window_size.dart';
+import 'dart:math';
 import 'dart:io';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'dart:convert';
-import 'package:intl/intl.dart';
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
+part 'main.g.dart';
 
-  if (Platform.isLinux || Platform.isWindows || Platform.isMacOS) {
-    setWindowTitle('Mood Tracker');
-    setWindowMinSize(const Size(400, 800));
-    setWindowMaxSize(const Size(400, 900));
+// -----------------------------
+// Modelo e Adapter (Hive)
+// -----------------------------
+class Task extends HiveObject {
+  String title;
+  String? notes;
+  bool done;
+  DateTime createdAt;
+
+  Task({
+    required this.title,
+    this.notes,
+    this.done = false,
+    DateTime? createdAt,
+  }) : createdAt = createdAt ?? DateTime.now();
+
+  // Construtor para Sembast
+  Task.fromMap(Map<String, dynamic> map)
+      : title = map['title'] as String,
+        notes = map['notes'] as String?,
+        done = map['done'] as bool,
+        createdAt = DateTime.fromMillisecondsSinceEpoch(map['createdAt'] as int);
+
+  Map<String, dynamic> toMap() {
+    return {
+      'title': title,
+      'notes': notes,
+      'done': done,
+      'createdAt': createdAt.millisecondsSinceEpoch,
+    };
   }
-
-  runApp(const MoodTrackerApp());
 }
 
-// ============= APP PRINCIPAL =============
-class MoodTrackerApp extends StatefulWidget {
-  const MoodTrackerApp({Key? key}) : super(key: key);
+// -----------------------------
+// Modelo para Isar
+// -----------------------------
+@collection
+class TaskIsar {
+  Id id = Isar.autoIncrement;
+  
+  late String title;
+  String? notes;
+  late bool done;
+  late DateTime createdAt;
 
-  @override
-  State<MoodTrackerApp> createState() => _MoodTrackerAppState();
-}
+  TaskIsar();
 
-class _MoodTrackerAppState extends State<MoodTrackerApp> {
-  ThemeMode _themeMode = ThemeMode.system;
-  late SharedPreferences _prefs;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadTheme();
-  }
-
-  Future<void> _loadTheme() async {
-    _prefs = await SharedPreferences.getInstance();
-    final String? savedTheme = _prefs.getString('theme_mode');
-    setState(() {
-      _themeMode = savedTheme == 'dark'
-          ? ThemeMode.dark
-          : savedTheme == 'light'
-              ? ThemeMode.light
-              : ThemeMode.system;
-    });
-  }
-
-  Future<void> _toggleTheme() async {
-    ThemeMode newTheme;
-    if (_themeMode == ThemeMode.dark) {
-      newTheme = ThemeMode.light;
-    } else if (_themeMode == ThemeMode.light) {
-      newTheme = ThemeMode.system;
-    } else {
-      newTheme = ThemeMode.dark;
-    }
-
-    setState(() {
-      _themeMode = newTheme;
-    });
-
-    await _prefs.setString(
-      'theme_mode',
-      newTheme == ThemeMode.dark
-          ? 'dark'
-          : newTheme == ThemeMode.light
-              ? 'light'
-              : 'system',
+  // Converter de/para Task
+  Task toTask() {
+    return Task(
+      title: title,
+      notes: notes,
+      done: done,
+      createdAt: createdAt,
     );
   }
 
-  IconData _getThemeIcon() {
-    switch (_themeMode) {
-      case ThemeMode.dark:
-        return Icons.light_mode;
-      case ThemeMode.light:
-        return Icons.dark_mode;
-      default:
-        return Icons.brightness_auto;
+  static TaskIsar fromTask(Task task) {
+    return TaskIsar()
+      ..title = task.title
+      ..notes = task.notes
+      ..done = task.done
+      ..createdAt = task.createdAt;
+  }
+}
+
+class TaskAdapter extends TypeAdapter<Task> {
+  @override
+  final int typeId = 0;
+
+  @override
+  Task read(BinaryReader reader) {
+    final title = reader.readString();
+    final hasNotes = reader.readBool();
+    final notes = hasNotes ? reader.readString() : null;
+    final done = reader.readBool();
+    final createdAtMillis = reader.readInt();
+
+    return Task(
+      title: title,
+      notes: notes,
+      done: done,
+      createdAt: DateTime.fromMillisecondsSinceEpoch(createdAtMillis),
+    );
+  }
+
+  @override
+  void write(BinaryWriter writer, Task obj) {
+    writer.writeString(obj.title);
+    writer.writeBool(obj.notes != null);
+    if (obj.notes != null) writer.writeString(obj.notes!);
+    writer.writeBool(obj.done);
+    writer.writeInt(obj.createdAt.millisecondsSinceEpoch);
+  }
+}
+
+// -----------------------------
+// Interface Abstrata para Bancos
+// -----------------------------
+abstract class DatabaseInterface {
+  String get name;
+  Future<void> initialize();
+  Future<void> insertTask(Task task);
+  Future<List<Task>> getAllTasks();
+  Future<void> updateTask(Task task);
+  Future<void> deleteTask(Task task);
+  Future<List<Task>> getCompletedTasks();
+  Future<void> clear();
+  Future<void> close();
+}
+
+// -----------------------------
+// Implementação Isar
+// -----------------------------
+class IsarDatabase implements DatabaseInterface {
+  late Isar isar;
+
+  @override
+  String get name => 'Isar';
+
+  @override
+  Future<void> initialize() async {
+    final dir = await getApplicationDocumentsDirectory();
+    isar = await Isar.open(
+      [TaskIsarSchema],
+      directory: dir.path,
+      name: 'tasks_isar_benchmark',
+    );
+  }
+
+  @override
+  Future<void> insertTask(Task task) async {
+    await isar.writeTxn(() async {
+      await isar.taskIsars.put(TaskIsar.fromTask(task));
+    });
+  }
+
+  @override
+  Future<List<Task>> getAllTasks() async {
+    final tasks = await isar.taskIsars.where().findAll();
+    return tasks.map((t) => t.toTask()).toList();
+  }
+
+  @override
+  Future<void> updateTask(Task task) async {
+    // No Isar, precisamos encontrar o ID original
+    final isarTasks = await isar.taskIsars.where().findAll();
+    if (isarTasks.isNotEmpty) {
+      final isarTask = isarTasks.first;
+      isarTask.title = task.title;
+      isarTask.notes = task.notes;
+      isarTask.done = task.done;
+      
+      await isar.writeTxn(() async {
+        await isar.taskIsars.put(isarTask);
+      });
     }
   }
+
+  @override
+  Future<void> deleteTask(Task task) async {
+    final tasks = await isar.taskIsars.where().findAll();
+    if (tasks.isNotEmpty) {
+      await isar.writeTxn(() async {
+        await isar.taskIsars.delete(tasks.first.id);
+      });
+    }
+  }
+
+  @override
+  Future<List<Task>> getCompletedTasks() async {
+    final tasks = await isar.taskIsars.filter().doneEqualTo(true).findAll();
+    return tasks.map((t) => t.toTask()).toList();
+  }
+
+  @override
+  Future<void> clear() async {
+    await isar.writeTxn(() async {
+      await isar.taskIsars.clear();
+    });
+  }
+
+  @override
+  Future<void> close() async {
+    await isar.close();
+  }
+}
+
+// -----------------------------
+// Implementação Sembast
+// -----------------------------
+class SembastDatabase implements DatabaseInterface {
+  late Database _db;
+  late StoreRef<int, Map<String, dynamic>> _store;
+
+  @override
+  String get name => 'Sembast';
+
+  @override
+  Future<void> initialize() async {
+    final dir = await getApplicationDocumentsDirectory();
+    final dbPath = '${dir.path}/tasks_sembast_benchmark.db';
+    
+    // Deletar banco existente para limpar
+    try {
+      await File(dbPath).delete();
+    } catch (_) {}
+    
+    _db = await databaseFactoryIo.openDatabase(dbPath);
+    _store = intMapStoreFactory.store('tasks');
+  }
+
+  @override
+  Future<void> insertTask(Task task) async {
+    await _store.add(_db, task.toMap());
+  }
+
+  @override
+  Future<List<Task>> getAllTasks() async {
+    final records = await _store.find(_db);
+    return records.map((record) => Task.fromMap(record.value)).toList();
+  }
+
+  @override
+  Future<void> updateTask(Task task) async {
+    final records = await _store.find(_db);
+    if (records.isNotEmpty) {
+      await _store.record(records.first.key).update(_db, task.toMap());
+    }
+  }
+
+  @override
+  Future<void> deleteTask(Task task) async {
+    final records = await _store.find(_db);
+    if (records.isNotEmpty) {
+      await _store.record(records.first.key).delete(_db);
+    }
+  }
+
+  @override
+  Future<List<Task>> getCompletedTasks() async {
+    final finder = Finder(
+      filter: Filter.equals('done', true),
+    );
+    final records = await _store.find(_db, finder: finder);
+    return records.map((record) => Task.fromMap(record.value)).toList();
+  }
+
+  @override
+  Future<void> clear() async {
+    await _store.delete(_db);
+  }
+
+  @override
+  Future<void> close() async {
+    await _db.close();
+  }
+}
+class HiveDatabase implements DatabaseInterface {
+  late Box<Task> tasksBox;
+
+  @override
+  String get name => 'Hive';
+
+  @override
+  Future<void> initialize() async {
+    await Hive.initFlutter();
+    if (!Hive.isAdapterRegistered(0)) {
+      Hive.registerAdapter(TaskAdapter());
+    }
+    tasksBox = await Hive.openBox<Task>('tasks_benchmark');
+  }
+
+  @override
+  Future<void> insertTask(Task task) async {
+    await tasksBox.add(task);
+  }
+
+  @override
+  Future<List<Task>> getAllTasks() async {
+    return tasksBox.values.toList();
+  }
+
+  @override
+  Future<void> updateTask(Task task) async {
+    await task.save();
+  }
+
+  @override
+  Future<void> deleteTask(Task task) async {
+    await task.delete();
+  }
+
+  @override
+  Future<List<Task>> getCompletedTasks() async {
+    return tasksBox.values.where((t) => t.done).toList();
+  }
+
+  @override
+  Future<void> clear() async {
+    await tasksBox.clear();
+  }
+
+  @override
+  Future<void> close() async {
+    await tasksBox.close();
+  }
+}
+
+// -----------------------------
+// Resultados do Benchmark
+// -----------------------------
+class BenchmarkResult {
+  final String operation;
+  final Duration duration;
+  final int itemCount;
+
+  BenchmarkResult({
+    required this.operation,
+    required this.duration,
+    required this.itemCount,
+  });
+
+  double get milliseconds => duration.inMicroseconds / 1000;
+  double get itemsPerSecond => itemCount / (duration.inMilliseconds / 1000);
+}
+
+// -----------------------------
+// Executor de Benchmark
+// -----------------------------
+class DatabaseBenchmark {
+  final DatabaseInterface database;
+  final List<BenchmarkResult> results = [];
+
+  DatabaseBenchmark(this.database);
+
+  Future<void> runAllTests({
+    required int writeCount,
+    required int readCount,
+    required Function(String) onProgress,
+  }) async {
+    results.clear();
+    
+    onProgress('Inicializando banco de dados...');
+    await database.initialize();
+    await database.clear();
+
+    // Teste 1: Inserções sequenciais
+    onProgress('Teste 1/6: Inserindo $writeCount tarefas...');
+    await _testInserts(writeCount);
+
+    // Teste 2: Leituras sequenciais
+    onProgress('Teste 2/6: Lendo todas as tarefas...');
+    await _testReadAll(readCount);
+
+    // Teste 3: Buscas com filtro
+    onProgress('Teste 3/6: Buscando tarefas concluídas...');
+    await _testFilteredQuery(readCount);
+
+    // Teste 4: Atualizações
+    onProgress('Teste 4/6: Atualizando tarefas...');
+    await _testUpdates(min(100, writeCount));
+
+    // Teste 5: Deleções
+    onProgress('Teste 5/6: Deletando tarefas...');
+    await _testDeletes(min(100, writeCount));
+
+    // Teste 6: Operações mistas
+    onProgress('Teste 6/6: Operações mistas...');
+    await _testMixedOperations(min(200, writeCount));
+
+    onProgress('Benchmark concluído!');
+  }
+
+  Future<void> _testInserts(int count) async {
+    final stopwatch = Stopwatch()..start();
+    
+    for (int i = 0; i < count; i++) {
+      final task = Task(
+        title: 'Tarefa de teste $i',
+        notes: 'Notas da tarefa $i com algum texto adicional',
+        done: i % 3 == 0,
+        createdAt: DateTime.now().subtract(Duration(days: i % 30)),
+      );
+      await database.insertTask(task);
+    }
+    
+    stopwatch.stop();
+    results.add(BenchmarkResult(
+      operation: 'Inserções Sequenciais',
+      duration: stopwatch.elapsed,
+      itemCount: count,
+    ));
+  }
+
+  Future<void> _testReadAll(int iterations) async {
+    final stopwatch = Stopwatch()..start();
+    
+    for (int i = 0; i < iterations; i++) {
+      await database.getAllTasks();
+    }
+    
+    stopwatch.stop();
+    results.add(BenchmarkResult(
+      operation: 'Leituras Completas',
+      duration: stopwatch.elapsed,
+      itemCount: iterations,
+    ));
+  }
+
+  Future<void> _testFilteredQuery(int iterations) async {
+    final stopwatch = Stopwatch()..start();
+    
+    for (int i = 0; i < iterations; i++) {
+      await database.getCompletedTasks();
+    }
+    
+    stopwatch.stop();
+    results.add(BenchmarkResult(
+      operation: 'Buscas com Filtro',
+      duration: stopwatch.elapsed,
+      itemCount: iterations,
+    ));
+  }
+
+  Future<void> _testUpdates(int count) async {
+    final tasks = await database.getAllTasks();
+    if (tasks.isEmpty) return;
+
+    final stopwatch = Stopwatch()..start();
+    
+    for (int i = 0; i < min(count, tasks.length); i++) {
+      final task = tasks[i];
+      task.done = !task.done;
+      task.title = '${task.title} - Atualizado';
+      await database.updateTask(task);
+    }
+    
+    stopwatch.stop();
+    results.add(BenchmarkResult(
+      operation: 'Atualizações',
+      duration: stopwatch.elapsed,
+      itemCount: min(count, tasks.length),
+    ));
+  }
+
+  Future<void> _testDeletes(int count) async {
+    final tasks = await database.getAllTasks();
+    if (tasks.isEmpty) return;
+
+    final stopwatch = Stopwatch()..start();
+    
+    for (int i = 0; i < min(count, tasks.length); i++) {
+      await database.deleteTask(tasks[i]);
+    }
+    
+    stopwatch.stop();
+    results.add(BenchmarkResult(
+      operation: 'Deleções',
+      duration: stopwatch.elapsed,
+      itemCount: min(count, tasks.length),
+    ));
+  }
+
+  Future<void> _testMixedOperations(int count) async {
+    final random = Random();
+    final stopwatch = Stopwatch()..start();
+    
+    for (int i = 0; i < count; i++) {
+      final operation = random.nextInt(4);
+      
+      switch (operation) {
+        case 0: // Insert
+          await database.insertTask(Task(
+            title: 'Tarefa mista $i',
+            done: false,
+          ));
+          break;
+        case 1: // Read
+          await database.getAllTasks();
+          break;
+        case 2: // Update
+          final tasks = await database.getAllTasks();
+          if (tasks.isNotEmpty) {
+            final task = tasks[random.nextInt(tasks.length)];
+            task.done = !task.done;
+            await database.updateTask(task);
+          }
+          break;
+        case 3: // Query
+          await database.getCompletedTasks();
+          break;
+      }
+    }
+    
+    stopwatch.stop();
+    results.add(BenchmarkResult(
+      operation: 'Operações Mistas',
+      duration: stopwatch.elapsed,
+      itemCount: count,
+    ));
+  }
+
+  Future<void> cleanup() async {
+    await database.clear();
+    await database.close();
+  }
+}
+
+// -----------------------------
+// Interface Gráfica
+// -----------------------------
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const BenchmarkApp());
+}
+
+class BenchmarkApp extends StatelessWidget {
+  const BenchmarkApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Mood Tracker',
-      themeMode: _themeMode,
+      title: 'Database Benchmark',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.light,
-        primarySwatch: Colors.pink,
-        scaffoldBackgroundColor: const Color(0xFFFFF8F0),
-        fontFamily: 'Roboto',
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Colors.transparent,
-          foregroundColor: Color(0xFFFF6B9D),
-          elevation: 0,
-        ),
-        cardColor: Colors.white,
-        snackBarTheme: const SnackBarThemeData(
-          backgroundColor: Color(0xFFFF6B9D),
-          contentTextStyle: TextStyle(color: Colors.white),
-        ),
-        shadowColor: Colors.grey,
-        textTheme: const TextTheme(
-          bodyMedium: TextStyle(color: Color(0xFF333333)),
-        ),
+        primarySwatch: Colors.blue,
+        scaffoldBackgroundColor: const Color(0xFFF5F5F5),
       ),
-      darkTheme: ThemeData(
-        brightness: Brightness.dark,
-        primarySwatch: Colors.pink,
-        scaffoldBackgroundColor: const Color(0xFF121212),
-        fontFamily: 'Roboto',
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Colors.transparent,
-          foregroundColor: Color(0xFFFF6B9D),
-          elevation: 0,
-        ),
-        cardColor: const Color(0xFF1E1E1E),
-        snackBarTheme: const SnackBarThemeData(
-          backgroundColor: Color(0xFFFF6B9D),
-          contentTextStyle: TextStyle(color: Colors.white),
-        ),
-        iconTheme: const IconThemeData(color: Color(0xFFFF6B9D)),
-        textTheme: const TextTheme(
-          bodyMedium: TextStyle(color: Colors.white70),
-          titleMedium: TextStyle(color: Colors.white),
-        ),
-        shadowColor: Colors.black26,
-      ),
-      home: SplashScreen(
-        onThemeToggle: _toggleTheme,
-        themeMode: _themeMode,
-      ),
-      debugShowCheckedModeBanner: false,
+      home: const BenchmarkPage(),
     );
   }
 }
 
-// ============= SPLASHSCREEN =============
-class SplashScreen extends StatefulWidget {
-  final VoidCallback onThemeToggle;
-  final ThemeMode themeMode;
-
-  const SplashScreen({
-    Key? key,
-    required this.onThemeToggle,
-    required this.themeMode,
-  }) : super(key: key);
+class BenchmarkPage extends StatefulWidget {
+  const BenchmarkPage({super.key});
 
   @override
-  State<SplashScreen> createState() => _SplashScreenState();
+  State<BenchmarkPage> createState() => _BenchmarkPageState();
 }
 
-class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderStateMixin {
-  late AnimationController _controller;
-  late Animation<double> _fadeAnimation;
-  late Animation<double> _scaleAnimation;
+class _BenchmarkPageState extends State<BenchmarkPage> {
+  DatabaseInterface? selectedDatabase;
+  final List<DatabaseInterface> databases = [
+    HiveDatabase(),
+    IsarDatabase(),
+    SembastDatabase(),
+    // Adicione outras implementações aqui:
+    // ObjectBoxDatabase(),
+    // RxDBDatabase(),
+    // NitriteDatabase(),
+  ];
 
-  @override
-  void initState() {
-    super.initState();
-    
-    _controller = AnimationController(
-      duration: const Duration(milliseconds: 1500),
-      vsync: this,
-    );
+  bool isRunning = false;
+  String currentProgress = '';
+  List<BenchmarkResult>? results;
+  
+  int writeCount = 1000;
+  int readCount = 100;
 
-    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
-      CurvedAnimation(parent: _controller, curve: Curves.easeIn),
-    );
+  Future<void> _runBenchmark() async {
+    if (selectedDatabase == null) return;
 
-    _scaleAnimation = Tween<double>(begin: 0.5, end: 1.0).animate(
-      CurvedAnimation(parent: _controller, curve: Curves.elasticOut),
-    );
-
-    _controller.forward();
-
-    Timer(const Duration(seconds: 3), () {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(
-          builder: (_) => HomePage(
-            onThemeToggle: widget.onThemeToggle,
-            themeMode: widget.themeMode,
-          ),
-        ),
-      );
-    });
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFFFFE4E1),
-      body: Center(
-        child: FadeTransition(
-          opacity: _fadeAnimation,
-          child: ScaleTransition(
-            scale: _scaleAnimation,
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Container(
-                  width: 120,
-                  height: 120,
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(30),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.pink.withOpacity(0.3),
-                        blurRadius: 20,
-                        offset: const Offset(0, 10),
-                      ),
-                    ],
-                  ),
-                  child: const Center(
-                    child: Icon(
-                      Icons.favorite,
-                      size: 60,
-                      color: Color(0xFFFF6B9D),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 30),
-                const Text(
-                  'Mood Tracker',
-                  style: TextStyle(
-                    fontSize: 28,
-                    fontWeight: FontWeight.w600,
-                    color: Color(0xFFFF6B9D),
-                    letterSpacing: 1.5,
-                  ),
-                ),
-                const SizedBox(height: 10),
-                const Text(
-                  'Como você está se sentindo hoje?',
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: Color(0xFFFF8FAB),
-                    fontWeight: FontWeight.w300,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ============= HOME PAGE =============
-class HomePage extends StatefulWidget {
-  final VoidCallback onThemeToggle;
-  final ThemeMode themeMode;
-
-  const HomePage({
-    Key? key,
-    required this.onThemeToggle,
-    required this.themeMode,
-  }) : super(key: key);
-
-  @override
-  State<HomePage> createState() => _HomePageState();
-}
-
-class _HomePageState extends State<HomePage> {
-  final List<MoodEntry> _moodHistory = [];
-  bool _isLoading = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadMoodHistory();
-  }
-
-  Future<void> _loadMoodHistory() async {
-    final prefs = await SharedPreferences.getInstance();
-    final String? moodData = prefs.getString('mood_history');
-    
-    if (moodData != null) {
-      final List<dynamic> decoded = jsonDecode(moodData);
-      setState(() {
-        _moodHistory.addAll(decoded.map((item) => MoodEntry.fromJson(item)).toList());
-        _isLoading = false;
-      });
-    } else {
-      setState(() {
-        _isLoading = false;
-      });
-    }
-  }
-
-  Future<void> _saveMoodHistory() async {
-    final prefs = await SharedPreferences.getInstance();
-    final String encoded = jsonEncode(_moodHistory.map((e) => e.toJson()).toList());
-    await prefs.setString('mood_history', encoded);
-  }
-
-  void _addMood(IconData icon, String label, int value, Color color) {
     setState(() {
-      _moodHistory.add(MoodEntry(
-        icon: icon,
-        label: label,
-        value: value,
-        color: color,
-        date: DateTime.now(),
-      ));
+      isRunning = true;
+      currentProgress = 'Iniciando...';
+      results = null;
     });
 
-    _saveMoodHistory();
+    final benchmark = DatabaseBenchmark(selectedDatabase!);
+    
+    try {
+      await benchmark.runAllTests(
+        writeCount: writeCount,
+        readCount: readCount,
+        onProgress: (progress) {
+          setState(() {
+            currentProgress = progress;
+          });
+        },
+      );
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Humor registrado: $label'),
-        backgroundColor: const Color(0xFFFF6B9D),
-        duration: const Duration(seconds: 2),
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-      ),
-    );
+      setState(() {
+        results = benchmark.results;
+        isRunning = false;
+        currentProgress = 'Concluído!';
+      });
+
+      await benchmark.cleanup();
+    } catch (e) {
+      setState(() {
+        isRunning = false;
+        currentProgress = 'Erro: $e';
+      });
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_isLoading) {
-      return const Scaffold(
-        body: Center(
-          child: CircularProgressIndicator(
-            color: Color(0xFFFF6B9D),
-          ),
-        ),
-      );
-    }
-
     return Scaffold(
       appBar: AppBar(
-        elevation: 0,
-        backgroundColor: Colors.transparent,
-        title: const Text(
-          'Meu Humor Hoje',
-          style: TextStyle(
-            color: Color(0xFFFF6B9D),
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-        actions: [
-          // BOTÃO DE TEMA
-          IconButton(
-            icon: Icon(
-              widget.themeMode == ThemeMode.dark
-                  ? Icons.light_mode
-                  : widget.themeMode == ThemeMode.light
-                      ? Icons.dark_mode
-                      : Icons.brightness_auto,
-              color: const Color(0xFFFF6B9D),
-            ),
-            onPressed: widget.onThemeToggle,
-            tooltip: 'Alternar tema',
-          ),
-          IconButton(
-            icon: const Icon(Icons.bar_chart_rounded, color: Color(0xFFFF6B9D)),
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => StatsPage(moodHistory: _moodHistory),
+        title: const Text('Database Benchmark'),
+        elevation: 2,
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Seleção de banco de dados
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Selecione o Banco de Dados',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButton<DatabaseInterface>(
+                      value: selectedDatabase,
+                      hint: const Text('Escolha um banco de dados'),
+                      isExpanded: true,
+                      items: databases.map((db) {
+                        return DropdownMenuItem(
+                          value: db,
+                          child: Text(db.name),
+                        );
+                      }).toList(),
+                      onChanged: (value) {
+                        setState(() {
+                          selectedDatabase = value;
+                        });
+                      },
+                    ),
+                  ],
                 ),
-              );
-            },
-          ),
-          IconButton(
-            icon: const Icon(Icons.history, color: Color(0xFFFF6B9D)),
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => HistoryPage(
-                    moodHistory: _moodHistory,
-                    onDelete: (index) {
-                      setState(() {
-                        _moodHistory.removeAt(index);
-                      });
-                      _saveMoodHistory();
+              ),
+            ),
+            const SizedBox(height: 16),
+
+            // Configurações
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Configurações',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            decoration: const InputDecoration(
+                              labelText: 'Inserções',
+                              border: OutlineInputBorder(),
+                            ),
+                            keyboardType: TextInputType.number,
+                            controller: TextEditingController(
+                              text: writeCount.toString(),
+                            ),
+                            onChanged: (value) {
+                              writeCount = int.tryParse(value) ?? 1000;
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 16),
+                        Expanded(
+                          child: TextField(
+                            decoration: const InputDecoration(
+                              labelText: 'Leituras',
+                              border: OutlineInputBorder(),
+                            ),
+                            keyboardType: TextInputType.number,
+                            controller: TextEditingController(
+                              text: readCount.toString(),
+                            ),
+                            onChanged: (value) {
+                              readCount = int.tryParse(value) ?? 100;
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+
+            // Botão executar
+            ElevatedButton.icon(
+              onPressed: selectedDatabase == null || isRunning
+                  ? null
+                  : _runBenchmark,
+              icon: isRunning
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
+                  : const Icon(Icons.play_arrow),
+              label: Text(isRunning ? 'Executando...' : 'Executar Benchmark'),
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.all(16),
+                textStyle: const TextStyle(fontSize: 16),
+              ),
+            ),
+            const SizedBox(height: 8),
+
+            // Progress
+            if (currentProgress.isNotEmpty)
+              Card(
+                color: Colors.blue[50],
+                child: Padding(
+                  padding: const EdgeInsets.all(12.0),
+                  child: Text(
+                    currentProgress,
+                    style: const TextStyle(fontSize: 14),
+                  ),
+                ),
+              ),
+            const SizedBox(height: 16),
+
+            // Resultados
+            if (results != null) ...[
+              const Text(
+                'Resultados',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Expanded(
+                child: Card(
+                  child: ListView.builder(
+                    padding: const EdgeInsets.all(8),
+                    itemCount: results!.length,
+                    itemBuilder: (context, index) {
+                      final result = results![index];
+                      return ListTile(
+                        title: Text(result.operation),
+                        subtitle: Text(
+                          '${result.itemCount} operações em ${result.milliseconds.toStringAsFixed(2)}ms',
+                        ),
+                        trailing: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            Text(
+                              '${result.itemsPerSecond.toStringAsFixed(0)} ops/s',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: Colors.green,
+                              ),
+                            ),
+                            Text(
+                              '${(result.milliseconds / result.itemCount).toStringAsFixed(3)}ms/op',
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey,
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
                     },
                   ),
                 ),
-              );
-            },
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          const SizedBox(height: 20),
-          const Text(
-            'Como você está se sentindo?',
-            style: TextStyle(
-              fontSize: 22,
-              fontWeight: FontWeight.w500,
-              color: Color(0xFF333333),
-            ),
-          ),
-          const SizedBox(height: 40),
-          Expanded(
-            child: GridView.count(
-              crossAxisCount: 2,
-              padding: const EdgeInsets.all(20),
-              mainAxisSpacing: 20,
-              crossAxisSpacing: 20,
-              children: [
-                _buildMoodCard(
-                  Icons.sentiment_very_satisfied,
-                  'Feliz',
-                  5,
-                  Colors.yellow.shade300,
-                ),
-                _buildMoodCard(
-                  Icons.sentiment_satisfied,
-                  'Calmo',
-                  4,
-                  Colors.green.shade300,
-                ),
-                _buildMoodCard(
-                  Icons.sentiment_neutral,
-                  'Neutro',
-                  3,
-                  Colors.grey.shade300,
-                ),
-                _buildMoodCard(
-                  Icons.sentiment_dissatisfied,
-                  'Triste',
-                  2,
-                  Colors.blue.shade300,
-                ),
-                _buildMoodCard(
-                  Icons.sentiment_very_dissatisfied,
-                  'Ansioso',
-                  2,
-                  Colors.orange.shade300,
-                ),
-                _buildMoodCard(
-                  Icons.mood_bad,
-                  'Irritado',
-                  1,
-                  Colors.red.shade300,
-                ),
-              ],
-            ),
-          ),
-          if (_moodHistory.isNotEmpty)
-            Container(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                children: [
-                  const Text(
-                    'Últimos registros',
-                    style: TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w500,
-                      color: Color(0xFF666666),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  SizedBox(
-                    height: 60,
-                    child: ListView.builder(
-                      scrollDirection: Axis.horizontal,
-                      itemCount: _moodHistory.length > 7 ? 7 : _moodHistory.length,
-                      itemBuilder: (context, index) {
-                        final mood = _moodHistory[_moodHistory.length - 1 - index];
-                        return Container(
-                          margin: const EdgeInsets.only(right: 10),
-                          padding: const EdgeInsets.all(10),
-                          decoration: BoxDecoration(
-                            color: Theme.of(context).cardColor,
-                            borderRadius: BorderRadius.circular(15),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.grey.withOpacity(0.2),
-                                blurRadius: 5,
-                                offset: const Offset(0, 3),
-                              ),
-                            ],
-                          ),
-                          child: Icon(
-                            mood.icon,
-                            size: 30,
-                            color: mood.color,
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                ],
               ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildMoodCard(IconData icon, String label, int value, Color color) {
-    return GestureDetector(
-      onTap: () => _addMood(icon, label, value, color),
-      child: Container(
-        decoration: BoxDecoration(
-          color: Theme.of(context).cardColor,
-          borderRadius: BorderRadius.circular(20),
-          boxShadow: [
-            BoxShadow(
-              color: color.withOpacity(0.3),
-              blurRadius: 10,
-              offset: const Offset(0, 5),
-            ),
-          ],
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Container(
-              width: 80,
-              height: 80,
-              decoration: BoxDecoration(
-                color: color.withOpacity(0.3),
-                shape: BoxShape.circle,
-              ),
-              child: Center(
-                child: Icon(
-                  icon,
-                  size: 45,
-                  color: color.withOpacity(0.9),
-                ),
-              ),
-            ),
-            const SizedBox(height: 15),
-            Text(
-              label,
-              style: const TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.w500,
-                color: Color(0xFF666666),
-              ),
-            ),
+            ],
           ],
         ),
       ),
     );
   }
-}
-
-// ============= HISTORY PAGE =============
-class HistoryPage extends StatelessWidget {
-  final List<MoodEntry> moodHistory;
-  final Function(int) onDelete;
-
-  const HistoryPage({
-    Key? key,
-    required this.moodHistory,
-    required this.onDelete,
-  }) : super(key: key);
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        elevation: 0,
-        backgroundColor: Colors.transparent,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Color(0xFFFF6B9D)),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: const Text(
-          'Histórico',
-          style: TextStyle(
-            color: Color(0xFFFF6B9D),
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-      ),
-      body: moodHistory.isEmpty
-          ? Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                    Icons.history,
-                    size: 80,
-                    color: Colors.grey.shade300,
-                  ),
-                  const SizedBox(height: 20),
-                  const Text(
-                    'Nenhum registro ainda',
-                    style: TextStyle(
-                      fontSize: 18,
-                      color: Color(0xFF999999),
-                    ),
-                  ),
-                ],
-              ),
-            )
-          : ListView.builder(
-              padding: const EdgeInsets.all(20),
-              itemCount: moodHistory.length,
-              itemBuilder: (context, index) {
-                final reversedIndex = moodHistory.length - 1 - index;
-                final mood = moodHistory[reversedIndex];
-                final dateStr = DateFormat('dd/MM/yyyy - HH:mm').format(mood.date);
-
-                return Dismissible(
-                  key: Key(mood.date.toString()),
-                  background: Container(
-                    margin: const EdgeInsets.only(bottom: 15),
-                    decoration: BoxDecoration(
-                      color: Colors.red.shade300,
-                      borderRadius: BorderRadius.circular(15),
-                    ),
-                    alignment: Alignment.centerRight,
-                    padding: const EdgeInsets.only(right: 20),
-                    child: const Icon(
-                      Icons.delete,
-                      color: Colors.white,
-                      size: 30,
-                    ),
-                  ),
-                  direction: DismissDirection.endToStart,
-                  onDismissed: (direction) {
-                    onDelete(reversedIndex);
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('Registro removido'),
-                        backgroundColor: Color(0xFFFF6B9D),
-                        duration: Duration(seconds: 2),
-                      ),
-                    );
-                  },
-                  child: Container(
-                    margin: const EdgeInsets.only(bottom: 15),
-                    padding: const EdgeInsets.all(20),
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).cardColor,
-                      borderRadius: BorderRadius.circular(15),
-                      boxShadow: [
-                        BoxShadow(
-                          color: mood.color.withOpacity(0.2),
-                          blurRadius: 5,
-                          offset: const Offset(0, 3),
-                        ),
-                      ],
-                    ),
-                    child: Row(
-                      children: [
-                        Container(
-                          padding: const EdgeInsets.all(15),
-                          decoration: BoxDecoration(
-                            color: mood.color.withOpacity(0.2),
-                            borderRadius: BorderRadius.circular(15),
-                          ),
-                          child: Icon(
-                            mood.icon,
-                            color: mood.color,
-                            size: 30,
-                          ),
-                        ),
-                        const SizedBox(width: 15),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                mood.label,
-                                style: const TextStyle(
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.w600,
-                                  color: Color(0xFF333333),
-                                ),
-                              ),
-                              const SizedBox(height: 5),
-                              Text(
-                                dateStr,
-                                style: const TextStyle(
-                                  fontSize: 13,
-                                  color: Color(0xFF999999),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        Icon(
-                          Icons.chevron_left,
-                          color: Colors.grey.shade400,
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              },
-            ),
-    );
-  }
-}
-
-// ============= STATS PAGE =============
-class StatsPage extends StatelessWidget {
-  final List<MoodEntry> moodHistory;
-
-  const StatsPage({Key? key, required this.moodHistory}) : super(key: key);
-
-  @override
-  Widget build(BuildContext context) {
-    final stats = _calculateStats();
-
-    return Scaffold(
-      appBar: AppBar(
-        elevation: 0,
-        backgroundColor: Colors.transparent,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Color(0xFFFF6B9D)),
-          onPressed: () => Navigator.pop(context),
-        ),
-        title: const Text(
-          'Estatísticas',
-          style: TextStyle(
-            color: Color(0xFFFF6B9D),
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-      ),
-      body: moodHistory.isEmpty
-          ? Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                    Icons.insert_chart_outlined,
-                    size: 80,
-                    color: Colors.grey.shade300,
-                  ),
-                  const SizedBox(height: 20),
-                  const Text(
-                    'Nenhum registro ainda',
-                    style: TextStyle(
-                      fontSize: 18,
-                      color: Color(0xFF999999),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  const Text(
-                    'Comece registrando seu humor!',
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: Color(0xFFBBBBBB),
-                    ),
-                  ),
-                ],
-              ),
-            )
-          : SingleChildScrollView(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  _buildStatCard(
-                    context: context,
-                    icon: Icons.trending_up,
-                    title: 'Média de Humor',
-                    value: stats['average']!.toStringAsFixed(1),
-                    subtitle: 'De 1 a 5',
-                    color: Colors.purple.shade300,
-                  ),
-                  const SizedBox(height: 15),
-                  _buildStatCard(
-                    context: context,
-                    icon: Icons.calendar_today,
-                    title: 'Total de Registros',
-                    value: moodHistory.length.toString(),
-                    subtitle: 'Dias registrados',
-                    color: Colors.blue.shade300,
-                  ),
-                  const SizedBox(height: 15),
-                  _buildMostCommonCard(context: context, entry: stats['mostCommonEntry'] as MoodEntry),
-                  const SizedBox(height: 30),
-                  const Text(
-                    'Distribuição dos Humores',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
-                      color: Color(0xFF333333),
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                  ..._buildMoodDistribution(context: context),
-                ],
-              ),
-            ),
-    );
-  }
-
-  Widget _buildStatCard({
-    required BuildContext context,
-    required IconData icon,
-    required String title,
-    required String value,
-    required String subtitle,
-    required Color color,
-  }) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: Theme.of(context).cardColor,
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(
-            color: color.withOpacity(0.3),
-            blurRadius: 10,
-            offset: const Offset(0, 5),
-          ),
-        ],
-      ),
-      child: Row(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: color.withOpacity(0.2),
-              borderRadius: BorderRadius.circular(15),
-            ),
-            child: Icon(icon, color: color, size: 30),
-          ),
-          const SizedBox(width: 15),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    fontSize: 14,
-                    color: Color(0xFF999999),
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-                const SizedBox(height: 5),
-                Text(
-                  value,
-                  style: TextStyle(
-                    fontSize: 28,
-                    fontWeight: FontWeight.bold,
-                    color: color,
-                  ),
-                ),
-                Text(
-                  subtitle,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    color: Color(0xFFBBBBBB),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildMostCommonCard({required BuildContext context, required MoodEntry entry}) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: Theme.of(context).cardColor,
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(
-            color: entry.color.withOpacity(0.3),
-            blurRadius: 10,
-            offset: const Offset(0, 5),
-          ),
-        ],
-      ),
-      child: Row(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: entry.color.withOpacity(0.2),
-              borderRadius: BorderRadius.circular(15),
-            ),
-            child: Icon(entry.icon, color: entry.color, size: 30),
-          ),
-          const SizedBox(width: 15),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Humor Mais Comum',
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: Color(0xFF999999),
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-                const SizedBox(height: 5),
-                Text(
-                  entry.label,
-                  style: TextStyle(
-                    fontSize: 28,
-                    fontWeight: FontWeight.bold,
-                    color: entry.color,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  List<Widget> _buildMoodDistribution({required BuildContext context}) {
-    final distribution = <String, MoodData>{};
-
-    for (var entry in moodHistory) {
-      final key = entry.label;
-      if (distribution.containsKey(key)) {
-        distribution[key]!.count++;
-      } else {
-        distribution[key] = MoodData(
-          icon: entry.icon,
-          color: entry.color,
-          label: entry.label,
-          count: 1,
-        );
-      }
-    }
-
-    return distribution.values.map((data) {
-      final percentage = (data.count / moodHistory.length * 100).toStringAsFixed(0);
-      return Container(
-        margin: const EdgeInsets.only(bottom: 15),
-        padding: const EdgeInsets.all(15),
-        decoration: BoxDecoration(
-          color: Theme.of(context).cardColor,
-          borderRadius: BorderRadius.circular(15),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.grey.withOpacity(0.2),
-              blurRadius: 5,
-              offset: const Offset(0, 3),
-            ),
-          ],
-        ),
-        child: Row(
-          children: [
-            Icon(
-              data.icon,
-              size: 35,
-              color: data.color,
-            ),
-            const SizedBox(width: 15),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    data.label,
-                    style: const TextStyle(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w500,
-                      color: Color(0xFF666666),
-                    ),
-                  ),
-                  const SizedBox(height: 5),
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(10),
-                    child: LinearProgressIndicator(
-                      value: data.count / moodHistory.length,
-                      backgroundColor: Colors.grey.shade200,
-                      valueColor: AlwaysStoppedAnimation<Color>(data.color),
-                      minHeight: 8,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(width: 15),
-            Text(
-              '$percentage%',
-              style: TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
-                color: data.color,
-              ),
-            ),
-          ],
-        ),
-      );
-    }).toList();
-  }
-
-  Map<String, dynamic> _calculateStats() {
-    if (moodHistory.isEmpty) {
-      return {'average': 0.0, 'mostCommonEntry': null};
-    }
-
-    double sum = 0;
-    final Map<String, int> counts = {};
-
-    for (var entry in moodHistory) {
-      sum += entry.value;
-      counts[entry.label] = (counts[entry.label] ?? 0) + 1;
-    }
-
-    final mostCommonLabel = counts.entries.reduce((a, b) => a.value > b.value ? a : b).key;
-    final mostCommonEntry = moodHistory.firstWhere((e) => e.label == mostCommonLabel);
-
-    return {
-      'average': sum / moodHistory.length,
-      'mostCommonEntry': mostCommonEntry,
-    };
-  }
-}
-
-// ============= DTOS =============
-class MoodEntry {
-  final IconData icon;
-  final String label;
-  final int value;
-  final Color color;
-  final DateTime date;
-
-  MoodEntry({
-    required this.icon,
-    required this.label,
-    required this.value,
-    required this.color,
-    required this.date,
-  });
-
-  Map<String, dynamic> toJson() {
-    return {
-      'iconCode': icon.codePoint,
-      'label': label,
-      'value': value,
-      'colorValue': color.value,
-      'date': date.toIso8601String(),
-    };
-  }
-
-  factory MoodEntry.fromJson(Map<String, dynamic> json) {
-    return MoodEntry(
-      icon: IconData(json['iconCode'], fontFamily: 'MaterialIcons'),
-      label: json['label'],
-      value: json['value'],
-      color: Color(json['colorValue']),
-      date: DateTime.parse(json['date']),
-    );
-  }
-}
-
-class MoodData {
-  final IconData icon;
-  final Color color;
-  final String label;
-  int count;
-  MoodData({
-    required this.icon,
-    required this.color,
-    required this.label,
-    required this.count,
-  });
 }
